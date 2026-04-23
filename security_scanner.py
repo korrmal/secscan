@@ -1511,6 +1511,176 @@ def save_report(filename: str, host_info: dict, open_ports: list,
 # ─────────────────────────────────────────────
 # РАЗРЕШЕНИЕ ХОСТА
 # ─────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# СКАНИРОВАНИЕ ПОДСЕТИ
+# ─────────────────────────────────────────────
+def ping_host(ip: str, timeout: float = 0.5) -> bool:
+    """Быстрая проверка доступности хоста через TCP на популярных портах."""
+    for port in [80, 22, 443, 445, 3389, 8080, 21, 23, 3306]:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            result = sock.connect_ex((ip, port))
+            sock.close()
+            if result == 0:
+                return True
+        except Exception:
+            pass
+    # fallback: ICMP через raw socket (требует root) или просто считаем живым
+    try:
+        socket.setdefaulttimeout(timeout)
+        socket.gethostbyaddr(ip)
+        return True
+    except Exception:
+        pass
+    return False
+
+
+def sweep_subnet(network: str, max_workers: int = 200, timeout: float = 0.5) -> list:
+    """
+    Обнаружение живых хостов в подсети.
+    Возвращает список IP-адресов, которые ответили хотя бы на один TCP-порт.
+    """
+    try:
+        net = ipaddress.ip_network(network, strict=False)
+    except ValueError as e:
+        print(c(Colors.RED, f"  [!] Некорректная подсеть: {e}"))
+        sys.exit(1)
+
+    hosts = [str(ip) for ip in net.hosts()]
+    total = len(hosts)
+
+    print(c(Colors.CYAN, f"\n  [*] Обнаружение хостов в {network} ({total} адресов)..."))
+
+    alive = []
+    done = 0
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(ping_host, ip, timeout): ip for ip in hosts}
+        for future in concurrent.futures.as_completed(futures):
+            done += 1
+            ip = futures[future]
+            if future.result():
+                alive.append(ip)
+                print(c(Colors.GREEN, f"  [+] {ip} — хост активен"))
+
+            if done % 50 == 0 or done == total:
+                pct  = done * 100 // total
+                bars = int(pct / 5)
+                bar  = "█" * bars + "░" * (20 - bars)
+                print(c(Colors.DIM, f"      [{bar}] {pct:3d}%  {done}/{total}"), end="\r")
+
+    print(" " * 80, end="\r")
+    alive_sorted = sorted(alive, key=lambda ip: [int(x) for x in ip.split(".")])
+    print(c(Colors.BOLD, f"\n  Найдено активных хостов: {c(Colors.GREEN, str(len(alive_sorted)))} из {total}\n"))
+    return alive_sorted
+
+
+def scan_subnet(network: str, ports: list, args) -> None:
+    """Полный цикл сканирования всех хостов подсети."""
+    alive_hosts = sweep_subnet(network, max_workers=200, timeout=args.timeout)
+
+    if not alive_hosts:
+        print(c(Colors.YELLOW, "  [!] Активных хостов не найдено."))
+        return
+
+    print(c(Colors.CYAN, "═" * 68))
+    print(c(Colors.BOLD, f"  Начинаю сканирование {len(alive_hosts)} хостов..."))
+    print(c(Colors.CYAN, "═" * 68))
+
+    input(c(Colors.DIM, "\n  Нажмите Enter для начала (Ctrl+C — отмена)..."))
+
+    subnet_results = []
+    online = not args.offline
+
+    for idx, ip in enumerate(alive_hosts, 1):
+        print(c(Colors.CYAN, f"\n\n  ━━━ [{idx}/{len(alive_hosts)}] Сканирование {ip} {'━' * (40 - len(ip))}"))
+
+        host_info = {"input": ip, "ip": ip, "hostname": None, "is_private": True}
+        try:
+            host_info["hostname"] = socket.gethostbyaddr(ip)[0]
+        except Exception:
+            pass
+
+        start_time = time.time()
+        open_ports = scan_ports(ip, ports, max_workers=args.threads, timeout=args.timeout)
+
+        findings    = []
+        exploit_map = {}
+
+        if not args.no_vulns and open_ports:
+            findings = check_vulnerabilities(ip, open_ports)
+
+        if not args.no_exploits and open_ports:
+            exploit_map = find_exploits_for_findings(open_ports, findings, online=online)
+
+        scan_time = time.time() - start_time
+        print_report(host_info, open_ports, findings, exploit_map, scan_time)
+
+        subnet_results.append({
+            "host":       host_info,
+            "open_ports": open_ports,
+            "findings":   findings,
+            "exploits":   exploit_map,
+            "scan_time":  round(scan_time, 2),
+        })
+
+        # Сохранить отдельный JSON для каждого хоста если задан --output
+        if args.output:
+            base, ext = (args.output.rsplit(".", 1) + ["json"])[:2], "json"
+            filename = f"{base[0]}_{ip.replace('.', '_')}.{ext}"
+            save_report(filename, host_info, open_ports, findings, exploit_map, scan_time)
+
+    # ── Итоговая сводка по подсети ──
+    print(c(Colors.CYAN, "\n" + "═" * 68))
+    print(c(Colors.BOLD, "  СВОДКА ПО ПОДСЕТИ: " + network))
+    print(c(Colors.CYAN, "═" * 68))
+    print(f"  {'Хостов проверено:':<28} {len(alive_hosts)}")
+
+    total_ports   = sum(len(r["open_ports"]) for r in subnet_results)
+    total_vulns   = sum(len(r["findings"])   for r in subnet_results)
+    total_exploits= sum(sum(len(v) for v in r["exploits"].values()) for r in subnet_results)
+    total_crits   = sum(sum(1 for f in r["findings"] if f["severity"] == "CRITICAL") for r in subnet_results)
+
+    print(f"  {'Открытых портов (всего):':<28} {total_ports}")
+    print(f"  {'Уязвимостей (всего):':<28} {total_vulns}")
+    print(f"  {'Критичных:':<28} {c(Colors.RED, str(total_crits)) if total_crits else c(Colors.GREEN, '0')}")
+    print(f"  {'Эксплойтов (всего):':<28} {total_exploits}")
+    print()
+
+    for r in subnet_results:
+        ip   = r["host"]["ip"]
+        hn   = r["host"].get("hostname") or ""
+        op   = len(r["open_ports"])
+        cr   = sum(1 for f in r["findings"] if f["severity"] == "CRITICAL")
+        hi   = sum(1 for f in r["findings"] if f["severity"] == "HIGH")
+        ex   = sum(len(v) for v in r["exploits"].values())
+        risk_icon = "🔴" if cr else ("🟠" if hi else ("🟡" if r["findings"] else "🟢"))
+        host_str  = f"{ip}" + (f" ({hn})" if hn else "")
+        print(f"  {risk_icon}  {host_str:<35} портов: {op:<4} уязв: {len(r['findings']):<4} эксплойтов: {ex}")
+
+    print(c(Colors.CYAN, "\n" + "═" * 68 + "\n"))
+
+    # Сохранить общий JSON-отчёт по подсети
+    if args.output:
+        subnet_report = {
+            "scan_date": datetime.datetime.now().isoformat(),
+            "subnet":    network,
+            "hosts":     subnet_results,
+            "summary": {
+                "total_hosts":    len(alive_hosts),
+                "total_ports":    total_ports,
+                "total_findings": total_vulns,
+                "total_exploits": total_exploits,
+                "critical":       total_crits,
+            },
+        }
+        with open(args.output, "w", encoding="utf-8") as fh:
+            json.dump(subnet_report, fh, ensure_ascii=False, indent=2,
+                      default=lambda o: str(o))
+        print(c(Colors.GREEN, f"  [✓] Общий отчёт по подсети сохранён: {args.output}"))
+
+
 def resolve_host(host: str) -> dict:
     info = {"input": host, "ip": None, "hostname": None, "is_private": False}
     try:
@@ -1553,16 +1723,19 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Примеры:
-  %(prog)s --target 192.168.1.1                   # полный скан 1-65535 (по умолчанию)
-  %(prog)s --target 192.168.1.1 --top-ports        # только топ-100 портов (быстро)
-  %(prog)s --target example.com --ports 1-1024     # конкретный диапазон
-  %(prog)s --target 10.0.0.1 --output report.json  # сохранить отчёт
-  %(prog)s --target 10.0.0.1 --no-exploits         # без поиска эксплойтов
-  %(prog)s --target 10.0.0.1 --offline             # только локальная база CVE
-  %(prog)s --target 10.0.0.1 --threads 300         # быстрее (больше потоков)
+  %(prog)s --target 192.168.1.1                         # полный скан одного хоста
+  %(prog)s --target 192.168.1.1 --top-ports             # только топ-100 портов (быстро)
+  %(prog)s --target example.com --ports 1-1024          # конкретный диапазон
+  %(prog)s --target 10.0.0.1 --output report.json       # сохранить отчёт
+  %(prog)s --target 10.0.0.1 --no-exploits              # без поиска эксплойтов
+  %(prog)s --target 10.0.0.1 --offline                  # только локальная база CVE
+  %(prog)s --subnet 192.168.1.0/24                      # скан всей подсети
+  %(prog)s --subnet 192.168.1.0/24 --top-ports          # подсеть + топ-100 портов
+  %(prog)s --subnet 10.0.0.0/24 --output subnet.json    # подсеть с отчётом
         """
     )
-    parser.add_argument("--target",      required=True,         help="IP-адрес или hostname цели")
+    parser.add_argument("--target",      default=None,          help="IP-адрес или hostname цели")
+    parser.add_argument("--subnet",      default=None,          help="Подсеть в CIDR нотации: 192.168.1.0/24")
     parser.add_argument("--ports",       default=None,          help="Порты: 80,443,1000-2000")
     parser.add_argument("--top-ports",   action="store_true",   help="Только топ-100 популярных портов (быстро)")
     parser.add_argument("--threads",     type=int, default=150, help="Количество потоков (150)")
@@ -1574,6 +1747,9 @@ def main():
 
     args = parser.parse_args()
 
+    if not args.target and not args.subnet:
+        parser.error("Необходимо указать --target или --subnet")
+
     if args.ports:
         ports = parse_ports(args.ports)
     elif args.top_ports:
@@ -1582,6 +1758,14 @@ def main():
         # По умолчанию — полный диапазон 1-65535
         ports = list(range(1, 65536))
 
+    # ── Режим сканирования подсети ──
+    if args.subnet:
+        print(c(Colors.YELLOW, f"\n  ⚠  Сканирование подсети {args.subnet}"))
+        print(c(Colors.RED,    "     Сканируйте ТОЛЬКО свои сети или при наличии разрешения!"))
+        scan_subnet(args.subnet, ports, args)
+        return
+
+    # ── Режим одиночного хоста ──
     host_info = resolve_host(args.target)
     print(c(Colors.WHITE, "\n  Цель: ") + c(Colors.BOLD, host_info["input"]) +
           c(Colors.DIM, f" → {host_info['ip']}"))
